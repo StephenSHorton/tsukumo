@@ -18,8 +18,11 @@ export function conversationId(): string | null {
 
 export interface HookScope {
   conversationId: string;
+  /** The first server watched; `guilds` lists every one when there are several. */
   guildId: string;
   guildName: string;
+  /** Every server this row watches channels in, when more than one (the router's chats). */
+  guilds?: Array<{ id: string; name: string }>;
   /** null = entire guild */
   channelIds: string[] | null;
   channelNames: string[];
@@ -41,6 +44,11 @@ export interface HookScope {
    * thread → owner, so ledger routing must not send it anything.
    */
   routing?: number;
+}
+
+/** Every server a row covers: `guildId`, plus `guilds` when it watches several. */
+export function hookGuildIds(hook: Pick<HookScope, "guildId" | "guilds">): string[] {
+  return [...new Set([hook.guildId, ...(hook.guilds ?? []).map((g) => g.id)])];
 }
 
 export function isOwner(hook: Pick<HookScope, "role">): boolean {
@@ -108,14 +116,14 @@ function hookIsLive(id: string, currentId: string, hook: HookScope): boolean {
   return heartbeatIsFresh(hook) || grokSessionExists(id);
 }
 
-function channelConflict(
-  existing: HookScope,
-  guildId: string,
-  channelIds: string[] | null,
-): boolean {
-  if (existing.guildId !== guildId) return false;
-  if (existing.channelIds === null || channelIds === null) return true;
-  return existing.channelIds.some((id) => channelIds.includes(id));
+function channelConflict(existing: HookScope, hook: HookScope): boolean {
+  // Channel ids are unique across servers, so two channel lists overlap or they don't.
+  if (existing.channelIds !== null && hook.channelIds !== null) {
+    return existing.channelIds.some((id) => hook.channelIds!.includes(id));
+  }
+  // A whole-server row conflicts with anything in that server.
+  const theirs = hookGuildIds(existing);
+  return hookGuildIds(hook).some((id) => theirs.includes(id));
 }
 
 export function hookAllowsChannel(
@@ -126,8 +134,7 @@ export function hookAllowsChannel(
     threadParentId?: string | null;
   },
 ): boolean {
-  if (opts.guildId && opts.guildId !== hook.guildId) return false;
-  if (!opts.guildId) return false;
+  if (!opts.guildId || !hookGuildIds(hook).includes(opts.guildId)) return false;
   if (hook.channelIds === null) return true;
   if (hook.channelIds.includes(opts.channelId)) return true;
   if (opts.threadParentId && hook.channelIds.includes(opts.threadParentId)) {
@@ -177,7 +184,7 @@ export class HookStore {
           409,
         );
       }
-      if (isOwner(hook) && isOwner(other) && channelConflict(other, hook.guildId, hook.channelIds)) {
+      if (isOwner(hook) && isOwner(other) && channelConflict(other, hook)) {
         const where =
           other.channelIds === null
             ? `server ${other.guildName}`

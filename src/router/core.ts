@@ -9,7 +9,7 @@
  * here, old-style watchers and Grok's bind all agree on who answers.
  */
 import { shouldNotifyChannel } from "../lib/channel.ts";
-import { describeHook, HookStore, hookAllowsChannel, isOwner, type HookScope } from "../lib/hook.ts";
+import { describeHook, HookStore, hookAllowsChannel, hookGuildIds, isOwner, type HookScope } from "../lib/hook.ts";
 import { GatewayError } from "../lib/errors.ts";
 import { frontDesk, routeMention, ROUTING_VERSION, type OwnerLookup, type Route } from "../lib/route.ts";
 import { MAX_DEFER_MS, planReminders, planSweep, SWEEP_LOOKBACK_MS } from "../lib/sweep.ts";
@@ -18,7 +18,16 @@ import type { GatewayMessage } from "../lib/types.ts";
 
 /** One line of an attached session's stream; the same events the per-session watcher prints. */
 export type RouterEvent =
-  | { type: "ready"; bot: string; botId: string; guildId: string; guildName: string; channels: Array<{ id: string; name: string }> }
+  | {
+      type: "ready";
+      bot: string;
+      botId: string;
+      /** The first server; `guildName` names them all ("A + B") when there are several. */
+      guildId: string;
+      guildName: string;
+      guilds: Array<{ id: string; name: string }>;
+      channels: Array<{ id: string; name: string }>;
+    }
   | { type: "claims"; role: "owner" | "listener"; threadIds: string[]; owner: string | null; listeners: number }
   | {
       type: "mention";
@@ -82,8 +91,10 @@ interface Attached {
   /** The claim row's boundAt, so we only ever clear the row we wrote. */
   boundAt: string;
   label?: string;
-  guildId: string;
-  guildName: string;
+  /** The servers its channels are in (several are fine). */
+  guilds: Array<{ id: string; name: string }>;
+  /** Each watched channel's server. */
+  guildOf: Map<string, string>;
   channelIds: string[];
   sinks: Set<Sink>;
   /** Events while it has no stream (within the grace window), delivered on reattach. */
@@ -122,12 +133,13 @@ export class RouterCore {
   attach(input: {
     sessionId: string;
     label?: string;
-    guildId: string;
-    guildName: string;
     channelIds: string[];
     channelNames: string[];
+    /** Each channel's server, in `channelIds` order. */
+    channelGuilds: Array<{ id: string; name: string }>;
     sink: Sink;
   }): { fresh: boolean } {
+    const guilds = [...new Map(input.channelGuilds.map((g) => [g.id, g])).values()];
     const existing = this.sessions.get(input.sessionId);
     const sameChannels =
       existing && existing.channelIds.length === input.channelIds.length && existing.channelIds.every((id) => input.channelIds.includes(id));
@@ -151,11 +163,13 @@ export class RouterCore {
 
     // A row that survived a router restart keeps its role and thread claims.
     const previous = this.deps.store.load(input.sessionId);
-    const keepThreads = previous && previous.guildId === input.guildId ? previous.threadIds : undefined;
+    const keepThreads =
+      previous && hookGuildIds(previous).some((id) => guilds.some((g) => g.id === id)) ? previous.threadIds : undefined;
     const base = {
       conversationId: input.sessionId,
-      guildId: input.guildId,
-      guildName: input.guildName,
+      guildId: guilds[0]!.id,
+      guildName: guilds.map((g) => g.name).join(" + "),
+      ...(guilds.length > 1 ? { guilds } : {}),
       channelIds: input.channelIds,
       channelNames: input.channelNames,
       boundAt: new Date(this.deps.now()).toISOString(),
@@ -177,8 +191,8 @@ export class RouterCore {
       sessionId: input.sessionId,
       boundAt: base.boundAt,
       label: input.label,
-      guildId: input.guildId,
-      guildName: input.guildName,
+      guilds,
+      guildOf: new Map(input.channelIds.map((id, i) => [id, input.channelGuilds[i]!.id])),
       channelIds: input.channelIds,
       sinks: new Set([input.sink]),
       queue: [],
@@ -249,7 +263,7 @@ export class RouterCore {
   private canHandOff(desk: Attached, channelId: string): boolean {
     const hooks = this.liveHooks();
     return desk.channelIds.every((id) => {
-      if (id !== channelId && frontDesk(hooks, { channelId: id, guildId: desk.guildId })?.conversationId !== desk.sessionId) return true;
+      if (id !== channelId && frontDesk(hooks, { channelId: id, guildId: desk.guildOf.get(id) ?? null })?.conversationId !== desk.sessionId) return true;
       return this.othersWatching(desk.sessionId, id).length > 0;
     });
   }
@@ -264,7 +278,7 @@ export class RouterCore {
     const { store } = this.deps;
     if (!this.canHandOff(desk, channelId)) return null;
     const fronted = desk.channelIds.filter(
-      (id) => id === channelId || frontDesk(this.liveHooks(), { channelId: id, guildId: desk.guildId })?.conversationId === desk.sessionId,
+      (id) => id === channelId || frontDesk(this.liveHooks(), { channelId: id, guildId: desk.guildOf.get(id) ?? null })?.conversationId === desk.sessionId,
     );
     try {
       store.update(desk.sessionId, (h) => ({ ...h, role: "listener" }));
@@ -274,8 +288,8 @@ export class RouterCore {
     let next: Attached | null = null;
     const promoted: Attached[] = [];
     for (const id of [channelId, ...fronted.filter((c) => c !== channelId)]) {
-      if (frontDesk(this.liveHooks(), { channelId: id, guildId: desk.guildId })) {
-        if (id === channelId) next = this.sessions.get(frontDesk(this.liveHooks(), { channelId: id, guildId: desk.guildId })!.conversationId) ?? null;
+      if (frontDesk(this.liveHooks(), { channelId: id, guildId: desk.guildOf.get(id) ?? null })) {
+        if (id === channelId) next = this.sessions.get(frontDesk(this.liveHooks(), { channelId: id, guildId: desk.guildOf.get(id) ?? null })!.conversationId) ?? null;
         continue;
       }
       for (const candidate of this.othersWatching(desk.sessionId, id)) {
@@ -289,7 +303,7 @@ export class RouterCore {
         }
       }
     }
-    const uncovered = fronted.some((id) => !frontDesk(this.liveHooks(), { channelId: id, guildId: desk.guildId }));
+    const uncovered = fronted.some((id) => !frontDesk(this.liveHooks(), { channelId: id, guildId: desk.guildOf.get(id) ?? null }));
     if (!next || uncovered) {
       // Undo: better a slow front desk than a channel with none.
       for (const s of promoted) {
@@ -316,7 +330,7 @@ export class RouterCore {
   /** The front desk left: the longest-attached chat still watching those channels becomes front desk. */
   private promoteSuccessor(gone: Attached): void {
     const candidates = [...this.sessions.values()]
-      .filter((s) => s.guildId === gone.guildId && s.channelIds.some((id) => gone.channelIds.includes(id)))
+      .filter((s) => s.channelIds.some((id) => gone.channelIds.includes(id)))
       .sort((a, b) => a.boundAt.localeCompare(b.boundAt));
     for (const next of candidates) {
       if (next.sessionId === gone.sessionId) continue;
@@ -370,7 +384,7 @@ export class RouterCore {
   private here(msg: Pick<GatewayMessage, "channelId" | "guildId" | "threadParentId">): Attached[] {
     return [...this.sessions.values()].filter((s) =>
       hookAllowsChannel(
-        { conversationId: s.sessionId, guildId: s.guildId, guildName: s.guildName, channelIds: s.channelIds, channelNames: [], boundAt: "" },
+        { conversationId: s.sessionId, guildId: s.guilds[0]!.id, guildName: "", guilds: s.guilds, channelIds: s.channelIds, channelNames: [], boundAt: "" },
         { ...msg, threadParentId: msg.threadParentId ?? this.deps.parentOf(msg.channelId) },
       ),
     );
@@ -507,7 +521,7 @@ export class RouterCore {
 
     for (const session of [...this.sessions.values()]) {
       if (!this.sessions.has(session.sessionId)) continue;
-      const deskOf = (channelId: string) => frontDesk(this.liveHooks(), { channelId, guildId: session.guildId })?.conversationId;
+      const deskOf = (channelId: string) => frontDesk(this.liveHooks(), { channelId, guildId: session.guildOf.get(channelId) ?? null })?.conversationId;
       const myChannels = session.channelIds.filter((id) => deskOf(id) === session.sessionId);
       if (myChannels.length === 0) continue;
       const actions = planSweep(listTaken(dirs.taken), listTaken(dirs.pending), {
@@ -690,7 +704,7 @@ export class RouterCore {
       mine = this.deps.store.load(session.sessionId);
       if (!mine) return;
       others = this.liveHooks().filter(
-        (h) => h.conversationId !== session.sessionId && h.guildId === mine!.guildId && (h.channelIds ?? []).some((id) => mine!.channelIds?.includes(id)),
+        (h) => h.conversationId !== session.sessionId && (h.channelIds ?? []).some((id) => mine!.channelIds?.includes(id)),
       );
     } catch {
       return;

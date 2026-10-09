@@ -320,15 +320,18 @@ async function main(): Promise<void> {
         if (!sessionId || channelIds.length === 0) return Response.json({ ok: false, error: "Give a sessionId and channelIds." }, { status: 400 });
 
         const channels = await Promise.all(channelIds.map((id) => live.client.channels.fetch(id).catch(() => null)));
-        const first = channels[0];
-        if (!first || first.type === ChannelType.DM || !("guildId" in first)) {
-          return Response.json({ ok: false, error: `Channel ${channelIds[0]} is not a server channel the bot can see.` }, { status: 400 });
+        // Channels from several servers are fine: each keeps its own server for routing.
+        const unseen = channels.findIndex((c) => !c || c.type === ChannelType.DM || !("guildId" in c));
+        if (unseen !== -1) {
+          return Response.json({ ok: false, error: `Channel ${channelIds[unseen]} is not a server channel the bot can see.` }, { status: 400 });
         }
-        if (channels.some((c) => !c || !("guildId" in c) || c.guildId !== first.guildId)) {
-          return Response.json({ ok: false, error: "Watch channels from one server at a time, all visible to the bot." }, { status: 400 });
-        }
-        const guildId = first.guildId;
-        const guildName = first.guild.name;
+        const channelGuilds = channels.map((c) => {
+          const g = (c as { guild: { id: string; name: string } }).guild;
+          return { id: g.id, name: g.name };
+        });
+        const guilds = [...new Map(channelGuilds.map((g) => [g.id, g])).values()];
+        const guildId = guilds[0]!.id;
+        const guildName = guilds.map((g) => g.name).join(" + ");
         const names = channels.map((c, i) => (c && "name" in c && c.name ? c.name : channelIds[i]!));
 
         let sink: Sink | null = null;
@@ -379,7 +382,7 @@ async function main(): Promise<void> {
         // After the response starts streaming: claim, introduce, backfill, catch up.
         queueMicrotask(async () => {
           try {
-            const { fresh } = core.attach({ sessionId, label, guildId, guildName, channelIds, channelNames: names, sink: sink! });
+            const { fresh } = core.attach({ sessionId, label, channelIds, channelNames: names, channelGuilds, sink: sink! });
             lastAttachedAt = Date.now();
             sink!.send({
               type: "ready",
@@ -387,6 +390,7 @@ async function main(): Promise<void> {
               botId: live.client.user?.id ?? "",
               guildId,
               guildName,
+              guilds,
               channels: channelIds.map((id, i) => ({ id, name: names[i]! })),
             });
             if (fresh) {
@@ -395,7 +399,7 @@ async function main(): Promise<void> {
                 sink!.send({ type: "history", channelId: id, channelName: names[channelIds.indexOf(id)]!, messages: history });
               }
             }
-            for (const id of newlyWatched) await catchUpChannel(guildId, id, marks);
+            for (const id of newlyWatched) await catchUpChannel(channelGuilds[channelIds.indexOf(id)]!.id, id, marks);
           } catch (err) {
             sink?.send({ type: "error", message: err instanceof Error ? err.message : String(err), fatal: true });
             core.forget(sessionId, { close: true, requeue: true });

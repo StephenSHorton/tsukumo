@@ -10,6 +10,9 @@ import { REATTACH_GRACE_MS, RouterCore, type RouterEvent, type Sink } from "./co
 const BOT = "100000000000000007";
 const MANAGED = "100000000000000001";
 const ALICE = "100000000000000008";
+const ACME = { id: "g1", name: "Example Guild" };
+const OTHER = { id: "g2", name: "Other Guild" };
+const OTHER_GENERAL = "100000000000000020";
 
 function setup(ledgerEntries: Array<Pick<LedgerEntry, "key" | "sessionId"> & Partial<LedgerEntry>> = []) {
   const root = mkdtempSync(join(tmpdir(), "tsukumo-router-"));
@@ -23,7 +26,7 @@ function setup(ledgerEntries: Array<Pick<LedgerEntry, "key" | "sessionId"> & Par
     dirs: Object.fromEntries(["taken", "done", "pending", "held", "rerouted", "flagged", "seen", "deferred"].map((d) => [d, join(root, d)])) as never,
     now: () => now,
     botId: () => BOT,
-    channelName: (id) => (id === MANAGED ? "managed" : id),
+    channelName: (id) => (id === MANAGED ? "managed" : id === OTHER_GENERAL ? "general" : id),
     parentOf: () => null,
     repoOf: (id) => (id === MANAGED ? "acme/webapp" : undefined),
     fetchMessage: async (_c, id) => fetched.find((m) => m.id === id) ?? null,
@@ -34,11 +37,14 @@ function setup(ledgerEntries: Array<Pick<LedgerEntry, "key" | "sessionId"> & Par
     return { send: (e) => sinks[name]!.push(e) };
   };
   const attach = (sessionId: string, label: string, s: Sink) =>
-    core.attach({ sessionId, label, guildId: "g1", guildName: "Example Guild", channelIds: [MANAGED], channelNames: ["managed"], sink: s });
+    core.attach({ sessionId, label, channelIds: [MANAGED], channelNames: ["managed"], channelGuilds: [ACME], sink: s });
   const advance = (ms: number) => {
     now += ms;
   };
-  return { core, store, sinks, sink, attach, advance, fetched, now: () => now };
+  /** A chat watching #managed (Example Guild) and #general (Other Guild) at once. */
+  const attachBoth = (sessionId: string, label: string, s: Sink) =>
+    core.attach({ sessionId, label, channelIds: [MANAGED, OTHER_GENERAL], channelNames: ["managed", "general"], channelGuilds: [ACME, OTHER], sink: s });
+  return { core, store, sinks, sink, attach, attachBoth, advance, fetched, now: () => now };
 }
 
 let n = 0;
@@ -203,7 +209,7 @@ describe("RouterCore", () => {
     first.store.update("a", (h) => ({ ...h, threadIds: ["100000000000000003"] }));
     // A new router process over the same claims file (rows still heartbeated).
     const second = new RouterCore({ ...(first.core as unknown as { deps: ConstructorParameters<typeof RouterCore>[0] }).deps });
-    second.attach({ sessionId: "a", label: "desk", guildId: "g1", guildName: "Example Guild", channelIds: [MANAGED], channelNames: ["managed"], sink: first.sink("a2") });
+    second.attach({ sessionId: "a", label: "desk", channelIds: [MANAGED], channelNames: ["managed"], channelGuilds: [ACME], sink: first.sink("a2") });
     expect(first.store.load("a")).toMatchObject({ role: "listener", threadIds: ["100000000000000003"] });
   });
 
@@ -322,5 +328,36 @@ describe("RouterCore", () => {
     await core.sweep();
     expect(sinks.a!.filter((e) => e.type === "overdue")).toHaveLength(2);
   });
-});
 
+  test("one chat can be the front desk for channels in several servers", async () => {
+    const { core, store, sinks, sink, attachBoth } = setup();
+    attachBoth("a", "desk", sink("a"));
+    expect(sinks.a!.find((e) => e.type === "claims")).toMatchObject({ role: "owner" });
+    expect(store.load("a")).toMatchObject({
+      guildId: "g1",
+      guildName: "Example Guild + Other Guild",
+      guilds: [ACME, OTHER],
+      channelIds: [MANAGED, OTHER_GENERAL],
+    });
+
+    await core.onMessage(mention("in managed"));
+    await core.onMessage(mention("in the other server", { channelId: OTHER_GENERAL, guildId: "g2" }));
+    expect(mentions(sinks.a).map((e) => [e.route, e.channelName])).toEqual([
+      ["mine", "managed"],
+      ["mine", "general"],
+    ]);
+
+    // A channel id from the wrong server doesn't match.
+    await core.onMessage(mention("spoofed", { channelId: OTHER_GENERAL, guildId: "g3" }));
+    expect(mentions(sinks.a)).toHaveLength(2);
+  });
+
+  test("a second chat in one of a multi-server desk's channels listens there, and takes over when it stops", async () => {
+    const { core, sinks, sink, attach, attachBoth, store } = setup();
+    attachBoth("a", "desk", sink("a"));
+    attach("b", "api work", sink("b"));
+    expect(sinks.b!.find((e) => e.type === "claims")).toMatchObject({ role: "listener", owner: "desk" });
+    core.control("a", "release", {});
+    expect(store.load("b")).toMatchObject({ role: "owner" });
+  });
+});

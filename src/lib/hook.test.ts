@@ -62,6 +62,29 @@ describe("hookAllowsChannel", () => {
 });
 
 describe("HookStore", () => {
+  test("a row can own channels in several servers; a whole-server row in one of them conflicts", () => {
+    const path = join(mkdtempSync(join(tmpdir(), "tsukumo-")), "hooks.json");
+    const store = new HookStore(path, () => true);
+    const both = scope({
+      conversationId: "desk",
+      guildName: "Example Guild + Other Guild",
+      guilds: [
+        { id: "g1", name: "Example Guild" },
+        { id: "g2", name: "Other Guild" },
+      ],
+      channelIds: ["c1", "d1"],
+      channelNames: ["eng", "general"],
+    });
+    store.save(both);
+    expect(hookAllowsChannel(both, { channelId: "d1", guildId: "g2" })).toBe(true);
+    expect(hookAllowsChannel(both, { channelId: "d1", guildId: "g9" })).toBe(false);
+
+    // Another channel in Other Guild is free to own; the same one or the whole server isn't.
+    store.save(scope({ conversationId: "other", guildId: "g2", guildName: "Other Guild", channelIds: ["d2"] }));
+    expect(() => store.save(scope({ conversationId: "dup", guildId: "g2", channelIds: ["d1"] }))).toThrow(GatewayError);
+    expect(() => store.save(scope({ conversationId: "grok", guildId: "g2", channelIds: null }))).toThrow(GatewayError);
+  });
+
   test("round-trip save/load and exclusive claim", () => {
     const path = join(mkdtempSync(join(tmpdir(), "tsukumo-")), "hooks.json");
     const live = () => true;

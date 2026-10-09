@@ -78,7 +78,7 @@ Set them with `claude plugin configure tsukumo-discord`, or in `/config` in a te
 In a Code tab session:
 
 ```
-/discord watch 123456789012345678      # or <#channel> or a channel link; several at once is fine
+/discord watch 123456789012345678      # or <#channel> or a channel link; several at once is fine, from any servers
 /discord block 234567890123456789     # everyone mode: hold this sender's mentions
 /discord mode allowlist                # switch: only allowed senders wake the session
 /discord allow 345678901234567890 Alice
@@ -126,7 +126,7 @@ While watching, a card above the prompt shows the Discord logo, the channel, the
 | `../src/lib/ledger.ts`, `refs.ts`, `prmeta.ts` | The authorship ledger, PR references, Cursor-agent PR detection |
 | `../.claude-plugin/marketplace.json` | Makes the repo a marketplace for install options A and C |
 
-**The router.** Every watching chat shares one Discord connection: the first chat to watch starts `src/router.ts` (detached; log in `.watch/router.log`), later chats attach to it, and it exits 30 minutes after the last chat leaves. It is not an always-on service, and it loses nothing while down: it saves the last message it saw in each channel and routes everything since when it next starts. A chat that reloads keeps its claim for 2 minutes and gets whatever was routed to it meanwhile. One Discord login per router start, not per chat. Set the mod's `transport` option to `direct` to give a chat its own connection instead (the older design; both kinds interoperate). `curl --unix-socket .watch/router.sock http://router/status` shows who's attached; `POST /stop` shuts it down.
+**The router.** Every watching chat shares one Discord connection: the first chat to watch starts `src/router.ts` (detached; log in `.watch/router.log`), later chats attach to it, and it exits 30 minutes after the last chat leaves. It is not an always-on service, and it loses nothing while down: it saves the last message it saw in each channel and routes everything since when it next starts. A chat that reloads keeps its claim for 2 minutes and gets whatever was routed to it meanwhile. One Discord login per router start, not per chat. Set the mod's `transport` option to `direct` to give a chat its own connection instead (the older design; both kinds interoperate). One chat can watch, and be front desk for, channels in several servers at once through the router; a `direct` watcher takes one server. `curl --unix-socket .watch/router.sock http://router/status` shows who's attached; `POST /stop` shuts it down.
 
 **Cursor cloud agents' PRs.** When a mention names a PR nobody in the ledger owns, the router checks it on GitHub (`gh`, cached a day). If a Cursor cloud agent opened it, the front desk gets a specific brief: acknowledge, look for a newer push from the agent, and either make the requested changes or say you'll hand them back to the agent.
 
