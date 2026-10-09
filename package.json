@@ -1,0 +1,25 @@
+{
+  "name": "tsukumo",
+  "version": "0.5.1",
+  "private": true,
+  "type": "module",
+  "description": "Discord gateway MCP for AI tools — 付喪神, stdio spawn-on-demand, no deploy",
+  "scripts": {
+    "mcp": "bun run src/mcp.ts",
+    "start": "bun run src/mcp.ts",
+    "serve": "bun run src/serve.ts",
+    "watch": "bun run src/watch.ts",
+    "call": "bun run src/call.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "discord.js": "^14.19.3",
+    "hono": "^4.0.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.8.0"
+  }
+}

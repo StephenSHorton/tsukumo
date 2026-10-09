@@ -1,0 +1,15 @@
+node_modules/
+.env
+.env.local
+.hooks.json
+.hooks.json.tmp
+dist/
+*.log
+.DS_Store
+.venv/
+.watch/
+.hooks.json.lock
+.hooks.json.*.tmp
+.ledger.json
+.ledger.json.lock
+.ledger.json.*.tmp

@@ -1,0 +1,14 @@
+{
+  "name": "tsukumo",
+  "description": "Claude Code mods for Tsukumo, the personal Discord gateway.",
+  "owner": {
+    "name": "Stephen Horton"
+  },
+  "plugins": [
+    {
+      "name": "tsukumo-discord",
+      "description": "Watch a Discord channel through Tsukumo from Claude Code.",
+      "source": "./claude-mod"
+    }
+  ]
+}

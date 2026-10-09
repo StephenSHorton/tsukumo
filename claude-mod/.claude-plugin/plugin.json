@@ -1,0 +1,33 @@
+{
+  "name": "tsukumo-discord",
+  "version": "0.6.1",
+  "description": "Tsukumo on Discord from Claude Code: watch channels live, have @mentions wake the right session, read and post anywhere the bot can see.",
+  "author": {
+    "name": "Stephen Horton"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "tsukumoDir": {
+      "type": "string",
+      "title": "Tsukumo checkout",
+      "description": "Folder holding Tsukumo's package.json and .env (~ is allowed).",
+      "default": "~/projects/tsukumo"
+    },
+    "bunPath": {
+      "type": "string",
+      "title": "Bun executable",
+      "description": "Path to bun. Empty means ~/.bun/bin/bun.",
+      "default": ""
+    },
+    "transport": {
+      "type": "string",
+      "title": "Discord connection",
+      "description": "router: every chat shares one Discord connection through the Tsukumo router (started on demand). direct: this chat runs its own watcher.",
+      "options": [
+        "router",
+        "direct"
+      ],
+      "default": "router"
+    }
+  }
+}
