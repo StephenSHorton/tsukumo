@@ -1,6 +1,6 @@
 {
   "name": "tsukumo-discord",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "Tsukumo on Discord from Claude Code: watch channels live, have @mentions wake the right session, read and post anywhere the bot can see.",
   "author": {
     "name": "Stephen Horton"

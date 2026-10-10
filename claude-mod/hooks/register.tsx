@@ -20,7 +20,7 @@ import {
 } from './wake'
 
 /** Matches .claude-plugin/plugin.json; shown in /discord and the pane so a stale copy is easy to spot. */
-const MOD_VERSION = '0.6.1'
+const MOD_VERSION = '0.6.2'
 const PANE = 'tsukumo-discord'
 const WATCH_TOOL = 'mcp__tsukumo-discord__watch'
 /** Discord's brand "blurple". */
