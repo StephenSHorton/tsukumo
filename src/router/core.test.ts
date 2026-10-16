@@ -329,6 +329,21 @@ describe("RouterCore", () => {
     expect(sinks.a!.filter((e) => e.type === "overdue")).toHaveLength(2);
   });
 
+  test("only the chat holding a mention can skip it, and a skipped mention is never moved or reminded", async () => {
+    const { core, sinks, sink, attach, advance } = setup();
+    attach("a", "desk", sink("a"));
+    attach("b", "api work", sink("b"));
+    const m = mention("👍");
+    await core.onMessage(m);
+    expect(core.control("b", "skip", { messageId: m.id } as never)).toMatchObject({ ok: false, status: 409 });
+    expect(core.control("a", "skip", { messageId: m.id } as never)).toEqual({ ok: true });
+    advance(2 * 60 * 60_000);
+    core.tick();
+    await core.sweep();
+    expect(sinks.a!.filter((e) => e.type === "handoff" || e.type === "overdue" || e.type === "moved")).toEqual([]);
+    expect(sinks.b!.filter((e) => e.type === "handoff" || e.type === "overdue")).toEqual([]);
+  });
+
   test("one chat can be the front desk for channels in several servers", async () => {
     const { core, store, sinks, sink, attachBoth } = setup();
     attachBoth("a", "desk", sink("a"));

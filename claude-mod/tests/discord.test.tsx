@@ -142,6 +142,7 @@ describe('/discord', () => {
       return { drop: 'recorded by the test' }
     })
     on('turn.start', ($, e) => ({ turnId: e.turnId }))
+    on('turn.complete', () => ({ text: '' }) as never)
     const acks: Array<{ url: string; socketPath?: string; body?: string }> = []
     on('http.fetch', ($, e) => {
       acks.push({ url: e.url, socketPath: e.init?.socketPath, body: e.init?.body })
@@ -211,6 +212,21 @@ describe('/discord', () => {
     await $.turn.start({ text: submitted[0]!, turnId: 'turn-1' })
     for (let i = 0; i < 20 && !acks.some(a => a.url === 'http://watcher/seen'); i++) await new Promise(r => setTimeout(r, 10))
     expect(acks.filter(a => a.url === 'http://watcher/seen').map(a => a.body)).toEqual([JSON.stringify({ messageId: mention.id })])
+
+    // No reply needed: skipping it marks it answered and takes 👀 and typing off.
+    const skipped = await $.tool.call({ tool: 'mcp__tsukumo-discord__skip_mention', message_id: mention.id } as never)
+    expect(String((skipped as { result?: unknown }).result)).toContain('Skipped')
+    expect(acks.filter(a => a.url === 'http://watcher/skip').map(a => a.body)).toEqual([
+      JSON.stringify({ channelId: MANAGED, messageId: mention.id }),
+    ])
+
+    // Its turn ending clears 👀 and typing whatever the turn did; another turn's end leaves them.
+    await $.turn.complete({ turnId: 'turn-0', answer: '', durationMs: 1, isAborted: false, reason: 'answer' } as never)
+    await $.turn.complete({ turnId: 'turn-1', answer: '', durationMs: 1, isAborted: false, reason: 'answer' } as never)
+    for (let i = 0; i < 20 && !acks.some(a => a.url === 'http://watcher/quiet'); i++) await new Promise(r => setTimeout(r, 10))
+    expect(acks.filter(a => a.url === 'http://watcher/quiet').map(a => a.body)).toEqual([
+      JSON.stringify({ channelId: MANAGED, messageId: mention.id }),
+    ])
     release()
   })
 
@@ -537,7 +553,7 @@ describe('/discord', () => {
 
   test('/discord shows the mod version, so a stale copy is easy to spot', async $ => {
     const ran = await $.command.run({ command: 'discord', args: 'help' })
-    expect(ran.text).toContain('tsukumo-discord 0.6.2')
+    expect(ran.text).toContain('tsukumo-discord 0.8.0')
   })
 
   test('a gh pr create in this session is recorded as authored by it', async ($, on) => {

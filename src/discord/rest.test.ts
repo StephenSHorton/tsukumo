@@ -5,7 +5,7 @@ const BOT = "100000000000000007";
 const CHANNEL = "100000000000000002";
 
 function fakeRest(handlers: Record<string, (body?: any, query?: URLSearchParams) => unknown>) {
-  const calls: Array<{ method: string; route: string; body?: any; query?: string }> = [];
+  const calls: Array<{ method: string; route: string; body?: any; query?: string; files?: Array<{ name: string; data: Uint8Array }> }> = [];
   const rest: RestLike = {
     async get(route, options) {
       calls.push({ method: "GET", route, query: options?.query?.toString() });
@@ -14,7 +14,7 @@ function fakeRest(handlers: Record<string, (body?: any, query?: URLSearchParams)
       return h(undefined, options?.query);
     },
     async post(route, options) {
-      calls.push({ method: "POST", route, body: options?.body });
+      calls.push({ method: "POST", route, body: options?.body, files: options?.files });
       const h = handlers[`POST ${route}`];
       if (!h) throw new Error(`unexpected POST ${route}`);
       return h(options?.body);
@@ -93,6 +93,21 @@ describe("DiscordRest", () => {
     await discord.send({ channelId: CHANNEL, from: "Claude", content: "follow-up", replyToId: "2", allowDuplicate: true });
     await discord.send({ channelId: CHANNEL, from: "Claude", content: "fresh post" });
     expect(calls.filter((c) => c.method === "POST").map((c) => c.body.nonce)).toEqual([undefined, undefined]);
+  });
+
+  test("a GIF uploads as a file, and a GIF alone still carries the from label", async () => {
+    const { rest, calls } = fakeRest({
+      ...base,
+      [`POST /channels/${CHANNEL}/messages`]: (body) => raw("9", body.content, { author: { id: BOT, username: "Tsukumo", bot: true } }),
+    });
+    const discord = new DiscordRest(rest);
+    const gif = { name: "wave.gif", data: new Uint8Array([71, 73, 70]) };
+    await discord.send({ channelId: CHANNEL, from: "Claude", content: "", files: [gif] });
+    await discord.send({ channelId: CHANNEL, from: "Claude", content: "nice", files: [gif] });
+    const posts = calls.filter((c) => c.method === "POST");
+    expect(posts.map((c) => c.body.content)).toEqual(["**Claude**", "**Claude**\nnice"]);
+    expect(posts.map((c) => c.files?.[0]?.name)).toEqual(["wave.gif", "wave.gif"]);
+    await expect(discord.send({ channelId: CHANNEL, from: "Claude", content: "" })).rejects.toThrow("content is required");
   });
 
   test("channels merge the guild's channels with its active threads, readable kinds only", async () => {

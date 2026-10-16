@@ -20,7 +20,7 @@ import {
 } from './wake'
 
 /** Matches .claude-plugin/plugin.json; shown in /discord and the pane so a stale copy is easy to spot. */
-const MOD_VERSION = '0.6.2'
+const MOD_VERSION = '0.8.0'
 const PANE = 'tsukumo-discord'
 const WATCH_TOOL = 'mcp__tsukumo-discord__watch'
 /** Discord's brand "blurple". */
@@ -115,8 +115,11 @@ async function deliver($: EngineInterface, mention: Mention) {
  * this chat has started on it, so it stays here however long the answer
  * takes. Retried while the watcher (re)starts after a reload.
  */
-async function markStarted($: EngineInterface, text: string) {
+async function markStarted($: EngineInterface, text: string, turnId: string) {
   const named = (await read($, mentionsAtom)).filter(m => m.awaitingStart && text.includes(`message id ${m.id}`))
+  if (named.length === 0) return
+  const ids = new Set(named.map(m => m.id))
+  await update($, mentionsAtom, list => list.map(x => (ids.has(x.id) ? { ...x, turnId } : x)))
   for (const m of named) {
     for (let attempt = 0; attempt < 5; attempt++) {
       if (!(await controlWatcher($, '/seen', { messageId: m.id }))) {
@@ -126,6 +129,19 @@ async function markStarted($: EngineInterface, text: string) {
       await $.clock.sleep(3_000)
     }
   }
+}
+
+/**
+ * A turn a mention woke has ended. Whether it replied, deferred, skipped or
+ * just stopped, nothing is working on it any more: take 👀 and typing off.
+ * A reply already cleared them; quiet is a no-op then.
+ */
+async function markEnded($: EngineInterface, turnId: string) {
+  const ended = (await read($, mentionsAtom)).filter(m => m.turnId === turnId)
+  if (ended.length === 0) return
+  const ids = new Set(ended.map(m => m.id))
+  await update($, mentionsAtom, list => list.map(x => (ids.has(x.id) ? { ...x, turnId: undefined } : x)))
+  for (const m of ended) await controlWatcher($, '/quiet', { channelId: m.channelId, messageId: m.id })
 }
 
 /** Another chat has the mention now: show it as theirs, so this chat's pane and reply guard agree. */
@@ -293,7 +309,7 @@ async function recordFromBash($: EngineInterface, command: string, stdout: strin
 async function onOverdue($: EngineInterface, messageId: string, channelName: string, minutes: number) {
   const mention = (await read($, mentionsAtom)).find(m => m.id === messageId)
   // A person held or dismissed it: their call stands.
-  if (mention && (mention.status === 'held' || mention.status === 'dismissed')) return
+  if (mention && (mention.status === 'held' || mention.status === 'dismissed' || mention.status === 'skipped')) return
   $.ui.toast(`Discord: a mention in #${channelName} has waited ${minutes} min with no reply from this chat.`)
   void $.prompt.submit({
     text: [
@@ -521,12 +537,16 @@ export const register: Register = (on, options) => {
     await $.tool.register({
       name: 'send_message',
       description:
-        "Post to any Discord channel the Tsukumo bot can see, as the bot. The text is prefixed with the bold `from` name. Optionally reply to a message. Max 2000 characters.",
+        "Post to any Discord channel the Tsukumo bot can see, as the bot. The text is prefixed with the bold `from` name. Optionally reply to a message, and attach a GIF with `gif` (it uploads the GIF itself, so don't paste its link in the text). Max 2000 characters.",
       inputSchema: {
         type: 'object',
         properties: {
           channel_id: CHANNEL_ID,
-          content: { type: 'string', description: 'Message text' },
+          content: { type: 'string', description: 'Message text; may be left out when posting only a GIF' },
+          gif: {
+            type: 'string',
+            description: 'A GIF to post with the message: a Tenor or Giphy page link, or a direct .gif/.webp/.mp4 URL (up to 10 MB)',
+          },
           from: { type: 'string', description: 'Client name prefixed in bold; default Claude' },
           reply_to_id: { type: 'string', description: 'Message id to reply to' },
           allow_duplicate: {
@@ -535,7 +555,7 @@ export const register: Register = (on, options) => {
               "A reply is refused if another chat is handling that mention now, or Tsukumo already replied to it in the last few minutes (another chat, or a retry). Set true for a deliberate reply anyway.",
           },
         },
-        required: ['channel_id', 'content'],
+        required: ['channel_id'],
       },
     })
     // Earlier versions pinned a status line; clear any left over.
@@ -571,6 +591,18 @@ export const register: Register = (on, options) => {
           note: { type: 'string', description: 'Why, for the reminder (e.g. "waiting on CI for #1437")' },
         },
         required: ['message_id', 'minutes'],
+      },
+    })
+    await $.tool.register({
+      name: 'skip_mention',
+      description:
+        "Choose not to reply to a Discord mention that needs no answer (a thanks, a 👍, a GIF, small talk between bots). Nothing is posted; the 👀 reaction and the typing indicator come off, and the mention counts as answered.",
+      inputSchema: {
+        type: 'object',
+        properties: {
+          message_id: { type: 'string', description: 'The mention\'s message id (from the wake prompt)' },
+        },
+        required: ['message_id'],
       },
     })
     await $.tool.register({
@@ -658,7 +690,10 @@ export const register: Register = (on, options) => {
       from?: string
       reply_to_id?: string
       allow_duplicate?: boolean
+      gif?: string
     }
+    const gif = String(input.gif ?? '').trim()
+    if (!String(input.content ?? '').trim() && !gif) return { result: 'Error: give the message text, a gif, or both.' }
     if (input.reply_to_id && !input.allow_duplicate) {
       const holder = await otherHolder($, input.reply_to_id)
       if (holder) {
@@ -670,6 +705,7 @@ export const register: Register = (on, options) => {
     const args = ['send', channelArg(input.channel_id), input.from || 'Claude']
     if (input.reply_to_id) args.push(input.reply_to_id)
     if (input.allow_duplicate) args.push('--allow-duplicate')
+    if (gif) args.push(`--gif=${gif}`)
     const result = await callTsukumo($, args, String(input.content ?? ''))
     try {
       const sent = JSON.parse(result) as { duplicate?: boolean; message?: { id: string; content: string } }
@@ -687,8 +723,28 @@ export const register: Register = (on, options) => {
   // A delivered mention's turn began (not just queued): the router keeps it here from now on.
   on('turn.start', async ($, e, next) => {
     const started = await next(e)
-    void markStarted($, e.text).catch(() => {})
+    void markStarted($, e.text, e.turnId).catch(() => {})
     return started
+  })
+
+  // The mention's turn ended (answered, skipped, deferred, or stopped): its typing ends with it.
+  on('turn.complete', async ($, e, next) => {
+    const done = await next(e)
+    void markEnded($, e.turnId).catch(() => {})
+    return done
+  })
+
+  on('tool.call', { tool: 'mcp__tsukumo-discord__skip_mention' }, async ($, e) => {
+    const messageId = String((e as unknown as { message_id?: string }).message_id ?? '').trim()
+    if (!/^\d{15,22}$/.test(messageId)) return { result: 'Error: give the mention\'s message id.' }
+    const mention = (await read($, mentionsAtom)).find(m => m.id === messageId)
+    if (!mention) return { result: 'Error: that isn\'t a mention this chat was woken for.' }
+    const refused = await controlWatcher($, '/skip', { channelId: mention.channelId, messageId })
+    if (refused) return { result: `Error: ${refused}` }
+    await update($, mentionsAtom, list =>
+      list.map(m => (m.id === messageId ? { ...m, status: 'skipped' as const, awaitingStart: false } : m)),
+    )
+    return { result: 'Skipped: no reply, and 👀 and typing are off. It counts as answered, so nothing will remind you about it.' }
   })
 
   // Watch this session's own shell commands for PRs it opens or reviews (authorship ledger).
@@ -1038,6 +1094,7 @@ export const register: Register = (on, options) => {
             {mention?.status === 'delivered' && <Text color={BLURPLE}>· woke this chat</Text>}
             {mention?.status === 'held' && <Text color="yellow">· held</Text>}
             {mention?.status === 'dismissed' && <Text dimColor>· dismissed</Text>}
+            {mention?.status === 'skipped' && <Text dimColor>· no reply needed</Text>}
             {!mention && m.mentionsBot && <Text dimColor>· mention</Text>}
             {mention?.status === 'elsewhere' && <Text dimColor>· {mention.routedTo ?? 'another chat'} answers</Text>}
             {inThread && <Text dimColor>↳ {m.channelName}</Text>}

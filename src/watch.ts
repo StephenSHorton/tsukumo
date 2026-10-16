@@ -14,8 +14,8 @@
  * src/call.ts.
  *
  * Events: ready · claims · mention (with its route) · message · history · error.
- * Control (unix socket, TSUKUMO_WATCH_SOCKET): POST /ack /own /listen
- * /claim-thread /release-thread /take, each with a small JSON body.
+ * Control (unix socket, TSUKUMO_WATCH_SOCKET): POST /ack /quiet /skip /own
+ * /listen /claim-thread /release-thread /take, each with a small JSON body.
  */
 import { mkdirSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -408,10 +408,23 @@ try {
         const path = new URL(request.url).pathname;
         if (request.method !== "POST") return new Response("not found", { status: 404 });
         const body = await request.text();
-        if (path === "/ack") {
+        if (path === "/ack" || path === "/quiet") {
+          // ack: 👀 + typing on a delivered mention. quiet: its turn ended, so drop both.
           const ack = parseAckRequest(body);
           if (!ack) return new Response("bad request", { status: 400 });
-          await live.working.start(ack.channelId, ack.messageId).catch(() => {});
+          if (path === "/ack") await live.working.start(ack.channelId, ack.messageId).catch(() => {});
+          else await live.working.complete(ack.channelId, ack.messageId).catch(() => {});
+          return Response.json({ ok: true });
+        }
+        if (path === "/skip") {
+          // The holder chose not to reply: answered, so it's never moved or reminded.
+          const ack = parseAckRequest(body);
+          if (!ack) return Response.json({ ok: false, error: "Give the mention's channel and message id." }, { status: 400 });
+          if (takenBy(TAKEN_DIR, ack.messageId)?.by !== conv) {
+            return Response.json({ ok: false, error: "This chat isn't the one handling that mention." }, { status: 409 });
+          }
+          mark(DONE_DIR, ack.messageId);
+          await live.working.complete(ack.channelId, ack.messageId).catch(() => {});
           return Response.json({ ok: true });
         }
         const input = (() => {

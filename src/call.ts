@@ -6,7 +6,7 @@
  *   bun run src/call.ts channels <guildId>
  *   bun run src/call.ts messages <channelId> [limit] [beforeMessageId]
  *   bun run src/call.ts message <channelId> <messageId>
- *   bun run src/call.ts send <channelId> <from> [replyToId] [--allow-duplicate]   # content on stdin; from "-" = TSUKUMO_YOUR_NAME
+ *   bun run src/call.ts send <channelId> <from> [replyToId] [--allow-duplicate] [--gif=<link>]   # content on stdin; from "-" = TSUKUMO_YOUR_NAME; --gif uploads it
  *   bun run src/call.ts thread <channelId> <from> <name…>     # optional first message on stdin
  *   bun run src/call.ts budget                                # gateway logins left today
  *   bun run src/call.ts record                                # ledger entries (JSON array) on stdin
@@ -22,6 +22,7 @@
  */
 import { loadConfig, loadProjectEnv } from "./config.ts";
 import { DiscordRest, createRest } from "./discord/rest.ts";
+import { fetchGif } from "./lib/gif.ts";
 import { Ledger, type LedgerRole } from "./lib/ledger.ts";
 
 const sessionId = process.env.TSUKUMO_SESSION_ID?.trim() || null;
@@ -68,7 +69,9 @@ async function run(): Promise<unknown> {
     case "send": {
       if (!args[0] || !args[1]) throw new Error("send needs a channel id and a from name");
       const content = (await Bun.stdin.text()).trim();
-      if (!content) throw new Error("send needs the message text on stdin");
+      const gifLink = argv.find((a) => a.startsWith("--gif="))?.slice("--gif=".length);
+      if (!content && !gifLink) throw new Error("send needs the message text on stdin, or a --gif=<link>");
+      const files = gifLink ? [await fetchGif(gifLink)] : undefined;
       const sent = await discord.send({
         channelId: args[0],
         // "-" is the person at the keyboard (the mod's message box), not an agent.
@@ -76,6 +79,7 @@ async function run(): Promise<unknown> {
         content,
         replyToId: args[2] || undefined,
         allowDuplicate: flags.has("--allow-duplicate"),
+        files,
       });
       if (!sent.duplicate) recordPosted([sent.message.id]);
       return sent;

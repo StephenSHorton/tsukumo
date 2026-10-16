@@ -56,7 +56,7 @@ function clientLabel(from: string): string {
  * If the agent already led with the same bold label, leave the body alone.
  * Old "Sam's AI (Grok)" values are reduced to the client name.
  */
-export function formatPostedContent(from: string, content: string): string {
+export function formatPostedContent(from: string, content: string, opts: { allowEmpty?: boolean } = {}): string {
   const speaker = clientLabel(from);
   const body = content.trim();
   if (!speaker) {
@@ -64,11 +64,13 @@ export function formatPostedContent(from: string, content: string): string {
       "from is required — the bot's nickname already says whose it is, so set from to the client (Grok, Cursor, Claude, …)",
     );
   }
+  const label = `**${speaker}**`;
+  // A post that is only an attachment (a GIF) still says who sent it.
+  if (!body && opts.allowEmpty) return label;
   if (!body) {
     throw new GatewayError("content is required");
   }
 
-  const label = `**${speaker}**`;
   const posted = body.toLowerCase().startsWith(label.toLowerCase())
     ? body
     : `${label}\n${body}`;

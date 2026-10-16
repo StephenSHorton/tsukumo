@@ -686,6 +686,14 @@ export class RouterCore {
         // A new deferral gets its own reminder when it passes.
         unmark(dirs.flagged, messageId);
         return { ok: true };
+      } else if (op === "skip") {
+        // The holder chose not to reply: answered, so it's never moved or reminded.
+        const messageId = String(input.messageId ?? "");
+        if (takenBy(dirs.taken, messageId)?.by !== sessionId) {
+          return { ok: false, status: 409, error: "This chat isn't the one handling that mention." };
+        }
+        mark(dirs.done, messageId);
+        return { ok: true };
       } else {
         return { ok: false, status: 404, error: `Unknown control "${op}".` };
       }

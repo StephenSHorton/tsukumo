@@ -50,8 +50,8 @@ export type Mention = {
   authorBot: boolean
   content: string
   createdAt: string
-  /** `elsewhere`: another session answers it (`routedTo`). */
-  status: 'delivered' | 'held' | 'dismissed' | 'elsewhere'
+  /** `elsewhere`: another session answers it (`routedTo`). `skipped`: this chat chose not to reply. */
+  status: 'delivered' | 'held' | 'dismissed' | 'elsewhere' | 'skipped'
   routedTo?: string
   /** Why the watcher routed it here (or elsewhere): "about webapp#1437, which this chat opened". */
   reason?: string
@@ -59,6 +59,8 @@ export type Mention = {
   unowned?: boolean
   /** Delivered, and its wake prompt's turn hasn't started yet (it may be queued behind another). */
   awaitingStart?: boolean
+  /** The turn its wake prompt started; when that turn ends, 👀 and typing come off. */
+  turnId?: string
 }
 
 declare module 'claude-code' {

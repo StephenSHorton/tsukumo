@@ -3,8 +3,8 @@
  * A session's line to the router (src/router.ts), spawned by the Claude Code
  * mod in place of the per-session watcher (src/watch.ts). Same contract with
  * the mod: JSON event lines on stdout, and the same control socket
- * (TSUKUMO_WATCH_SOCKET) for /ack /own /listen /claim-thread /release-thread
- * /take /hold, forwarded to the router. No Discord login of its own.
+ * (TSUKUMO_WATCH_SOCKET) for /ack /quiet /skip /own /listen /claim-thread
+ * /release-thread /take /hold, forwarded to the router. No Discord login of its own.
  *
  *   TSUKUMO_SESSION_ID=<claude session id> bun run src/attach.ts <channelId>[,<channelId>…]
  *

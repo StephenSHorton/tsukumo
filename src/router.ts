@@ -11,8 +11,9 @@
  * Unix socket at .watch/router.sock:
  *   GET  /status                       who's attached, which channels
  *   POST /attach {sessionId,label,channelIds}   → a stream of JSON event lines
- *   POST /control {sessionId,op,…}     ack · own · listen · claim-thread ·
- *                                      release-thread · take · hold
+ *   POST /control {sessionId,op,…}     ack · quiet · own · listen · claim-thread ·
+ *                                      release-thread · take · hold · seen ·
+ *                                      holder · defer · skip
  *   POST /stop                         release every claim and exit
  */
 import { existsSync, linkSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -298,10 +299,12 @@ async function main(): Promise<void> {
       if (path === "/control") {
         const sessionId = String(input.sessionId ?? "");
         const op = String(input.op ?? "");
-        if (op === "ack") {
+        if (op === "ack" || op === "quiet") {
+          // ack: 👀 + typing on a delivered mention. quiet: its turn ended, so drop both.
           const ack = parseAckRequest(JSON.stringify(input));
           if (!ack) return Response.json({ ok: false, error: "bad request" }, { status: 400 });
-          await live.working.start(ack.channelId, ack.messageId).catch(() => {});
+          if (op === "ack") await live.working.start(ack.channelId, ack.messageId).catch(() => {});
+          else await live.working.complete(ack.channelId, ack.messageId).catch(() => {});
           return Response.json({ ok: true });
         }
         let parent: string | null = null;
@@ -310,6 +313,10 @@ async function main(): Promise<void> {
           parent = thread?.isThread() ? thread.parentId : null;
         }
         const result = core.control(sessionId, op, input as never, parent);
+        if (op === "skip" && result.ok) {
+          const ack = parseAckRequest(JSON.stringify(input));
+          if (ack) await live.working.complete(ack.channelId, ack.messageId).catch(() => {});
+        }
         return Response.json(result, { status: result.ok ? 200 : result.status });
       }
 

@@ -13,7 +13,7 @@ import type { GatewayChannel, GatewayGuild, GatewayMessage } from "../lib/types.
 /** The slice of discord.js's REST client we use; tests pass a fake. */
 export interface RestLike {
   get(route: `/${string}`, options?: { query?: URLSearchParams }): Promise<unknown>;
-  post(route: `/${string}`, options?: { body?: unknown }): Promise<unknown>;
+  post(route: `/${string}`, options?: { body?: unknown; files?: Array<{ name: string; data: Uint8Array }> }): Promise<unknown>;
 }
 
 export function createRest(token: string): RestLike {
@@ -214,8 +214,10 @@ export class DiscordRest {
     content: string;
     replyToId?: string;
     allowDuplicate?: boolean;
+    /** Uploaded with the post, so a GIF shows as itself rather than a link. */
+    files?: Array<{ name: string; data: Uint8Array }>;
   }): Promise<SendResult> {
-    const content = formatPostedContent(input.from, input.content);
+    const content = formatPostedContent(input.from, input.content, { allowEmpty: Boolean(input.files?.length) });
     const body: Record<string, unknown> = { content };
     if (input.replyToId) {
       body.message_reference = { message_id: input.replyToId, fail_if_not_exists: false };
@@ -225,7 +227,7 @@ export class DiscordRest {
       }
     }
     const [raw, ctx] = await Promise.all([
-      this.rest.post(Routes.channelMessages(input.channelId), { body }) as Promise<RawMessage>,
+      this.rest.post(Routes.channelMessages(input.channelId), input.files?.length ? { body, files: input.files } : { body }) as Promise<RawMessage>,
       this.context(input.channelId),
     ]);
     return { message: messageFromRest(raw, ctx), duplicate: raw.content !== content };
