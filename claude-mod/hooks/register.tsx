@@ -13,6 +13,7 @@ import {
   summarizeCall,
   takeEvents,
   ledgerEntriesFromBash,
+  directPrompt,
   repoFromRemote,
   toFeedMessage,
   toMention,
@@ -20,7 +21,7 @@ import {
 } from './wake'
 
 /** Matches .claude-plugin/plugin.json; shown in /discord and the pane so a stale copy is easy to spot. */
-const MOD_VERSION = '0.8.0'
+const MOD_VERSION = '0.9.0'
 const PANE = 'tsukumo-discord'
 const WATCH_TOOL = 'mcp__tsukumo-discord__watch'
 /** Discord's brand "blurple". */
@@ -234,7 +235,7 @@ async function sessionLabel($: EngineInterface): Promise<string> {
     const named = await $.store.get(`label:${id}`)
     if (typeof named === 'string' && named.trim()) return named.trim()
     const cwd = await $.session.cwd()
-    return `${cwd.split('/').filter(Boolean).pop() ?? 'chat'} · ${id.slice(0, 8)}`
+    return `${cwd.split(/[\\/]/).filter(Boolean).pop() ?? 'chat'} · ${id.slice(0, 8)}`
   } catch {
     // A name is a nicety; never let it stop the watch.
     return `chat · ${id.slice(0, 8)}`
@@ -269,6 +270,34 @@ async function otherHolder($: EngineInterface, messageId: string): Promise<strin
   const answer = await askWatcher($, '/holder', { messageId })
   if (!answer.ok || !answer.holder || answer.mine) return null
   return typeof answer.label === 'string' ? answer.label : 'another chat'
+}
+
+/** Sends a direct message to another local chat through the router; the tool's result text. */
+async function sendDirect(
+  $: EngineInterface,
+  message: { to: string; content: string; from?: string; replyToId?: string; about?: { channelId: string; messageId: string } },
+): Promise<string> {
+  if (!message.to.trim()) return 'Error: say which chat (`to`); list_chats shows them.'
+  if (!message.content.trim()) return 'Error: give the message text.'
+  const answer = await askWatcher($, '/direct', message)
+  if (!answer.ok) {
+    const why = answer.error.startsWith('Unknown control') ? "this chat's watcher doesn't support direct messages (it needs the router transport)" : answer.error
+    return `Error: not sent. ${why}`
+  }
+  const where = answer.queued ? ' It is reloading, so it gets the message when it reconnects (within a couple of minutes).' : ''
+  return `Sent directly to ${String(answer.to)} (session ${String(answer.session).slice(0, 8)}); it wakes with it. Nothing was posted on Discord. Direct message id ${String(answer.id)}.${where}`
+}
+
+/**
+ * If another local chat posted the Discord message being replied to, sends the reply to that chat directly and
+ * returns the result text; otherwise null (post as usual).
+ */
+async function replyDirectly($: EngineInterface, replyToId: string, channelId: string, content: string, from?: string): Promise<string | null> {
+  const poster = await askWatcher($, '/poster', { messageId: replyToId })
+  if (!poster.ok || typeof poster.session !== 'string' || !poster.session) return null
+  const sent = await sendDirect($, { to: poster.session, content, from, about: { channelId, messageId: replyToId } })
+  if (sent.startsWith('Error:')) return null
+  return `${sent} (Message ${replyToId} was posted by that chat, and a reply on Discord would never wake it. If the team or people on other machines should see this, call send_message again with post: true.)`
 }
 
 /** Owner answers the channel's mentions; listener only watches (claimed threads still come here). */
@@ -425,6 +454,9 @@ async function startWatcher($: EngineInterface, channelIds: string[]) {
             await onMoved($, event.messageId, event.to, event.channelName)
           } else if (event.type === 'mention') {
             await onMention($, toMention(event))
+          } else if (event.type === 'direct') {
+            $.ui.toast(`Discord: direct message from ${event.from} (another chat here)`)
+            void $.prompt.submit({ text: directPrompt(event) }).catch(() => {})
           } else if (event.type === 'message' || event.type === 'history') {
             const botId = (await read($, watchAtom))?.botId
             const incoming =
@@ -548,7 +580,16 @@ export const register: Register = (on, options) => {
             description: 'A GIF to post with the message: a Tenor or Giphy page link, or a direct .gif/.webp/.mp4 URL (up to 10 MB)',
           },
           from: { type: 'string', description: 'Client name prefixed in bold; default Claude' },
-          reply_to_id: { type: 'string', description: 'Message id to reply to' },
+          reply_to_id: {
+            type: 'string',
+            description:
+              "Message id to reply to. If another chat on this machine posted that message, the reply goes to it directly (message_chat) instead of being posted, since chats sharing the bot can't wake each other on Discord; set `post` to post it publicly anyway.",
+          },
+          post: {
+            type: 'boolean',
+            description:
+              "Post on Discord even when reply_to_id is another local chat's message (when the team or people on other machines should see it).",
+          },
           allow_duplicate: {
             type: 'boolean',
             description:
@@ -557,6 +598,26 @@ export const register: Register = (on, options) => {
         },
         required: ['channel_id'],
       },
+    })
+    await $.tool.register({
+      name: 'message_chat',
+      description:
+        "Message another Claude chat on this machine directly, without Discord: it wakes that chat with your message, and nobody else sees it. Chats sharing the Tsukumo bot can't wake each other through Discord (the bot's own posts never notify), so use this to ask or tell a local chat something. `to` is the name it posts under (e.g. \"garden work\"), its label or session id; list_chats shows them. Pushes, claims and anything the team or other machines should see still go on Discord. Two chats can send each other at most 8 messages (both ways together) per 10 minutes.",
+      inputSchema: {
+        type: 'object',
+        properties: {
+          to: { type: 'string', description: 'The chat: the name it posts under, its label, or its session id' },
+          content: { type: 'string', description: 'Message text' },
+          from: { type: 'string', description: 'The name you post under on Discord (e.g. "front desk"), so the other chat can answer by name' },
+          reply_to_id: { type: 'string', description: 'The direct message id you are answering (from its wake prompt)' },
+        },
+        required: ['to', 'content'],
+      },
+    })
+    await $.tool.register({
+      name: 'list_chats',
+      description: 'List the other Claude chats on this machine attached to the Tsukumo router, with the names they post under, for message_chat.',
+      inputSchema: { type: 'object', properties: {} },
     })
     // Earlier versions pinned a status line; clear any left over.
     $.ui.status(undefined)
@@ -691,9 +752,16 @@ export const register: Register = (on, options) => {
       reply_to_id?: string
       allow_duplicate?: boolean
       gif?: string
+      post?: boolean
     }
     const gif = String(input.gif ?? '').trim()
     if (!String(input.content ?? '').trim() && !gif) return { result: 'Error: give the message text, a gif, or both.' }
+    // A reply to another local chat's post: it would never wake that chat on Discord, so hand it over directly.
+    if (input.reply_to_id && !input.post && !gif) {
+      const direct = await replyDirectly($, input.reply_to_id, channelArg(input.channel_id), String(input.content ?? ''), input.from)
+      if (direct) return { result: direct }
+    }
+    if (input.from) void controlWatcher($, '/alias', { name: input.from })
     if (input.reply_to_id && !input.allow_duplicate) {
       const holder = await otherHolder($, input.reply_to_id)
       if (holder) {
@@ -732,6 +800,23 @@ export const register: Register = (on, options) => {
     const done = await next(e)
     void markEnded($, e.turnId).catch(() => {})
     return done
+  })
+
+  on('tool.call', { tool: 'mcp__tsukumo-discord__message_chat' }, async ($, e) => {
+    const input = e as unknown as { to?: string; content?: string; from?: string; reply_to_id?: string }
+    return { result: await sendDirect($, { to: String(input.to ?? ''), content: String(input.content ?? ''), from: input.from, replyToId: input.reply_to_id }) }
+  })
+
+  on('tool.call', { tool: 'mcp__tsukumo-discord__list_chats' }, async $ => {
+    const answer = await askWatcher($, '/chats')
+    if (!answer.ok) return { result: `Error: ${answer.error}` }
+    const chats = (answer.chats ?? []) as Array<{ session: string; name: string; label: string | null; aliases: string[]; connected: boolean }>
+    if (chats.length === 0) return { result: 'No other chat on this machine is attached to the Tsukumo router right now.' }
+    return {
+      result: chats
+        .map(c => `${c.name} · session ${c.session}${c.label && c.label.toLowerCase() !== c.name ? ` · label ${c.label}` : ''}${c.aliases.length > 1 ? ` · also ${c.aliases.filter(a => a !== c.name).join(', ')}` : ''}${c.connected ? '' : ' · reloading'}`)
+        .join('\n'),
+    }
   })
 
   on('tool.call', { tool: 'mcp__tsukumo-discord__skip_mention' }, async ($, e) => {

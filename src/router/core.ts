@@ -43,6 +43,23 @@ export type RouterEvent =
   /** This chat, as front desk, sat on a mention; it and the front-desk role went to `to`. */
   | { type: "handoff"; messageId: string; channelId: string; channelName: string; minutes: number; to: string }
   | { type: "message"; channelName: string; message: GatewayMessage }
+  /**
+   * A message straight from another chat attached to this router: agent to agent on one machine, never posted
+   * on Discord (chats sharing the bot can't wake each other there; the bot's own posts never notify).
+   */
+  | {
+      type: "direct";
+      id: string;
+      /** The name it was sent under (its `from`), else the sender's label. */
+      from: string;
+      fromSession: string;
+      content: string;
+      /** The direct message this answers, if any. */
+      replyToId?: string;
+      /** The Discord message it replies to, when it began as a reply there. */
+      about?: { channelId: string; messageId: string };
+      sentAt: string;
+    }
   | { type: "history"; channelId: string; channelName: string; messages: GatewayMessage[] }
   /** `fatal`: the router dropped this chat (its claim was removed); the attach process should stop. */
   | { type: "error"; message: string; fatal?: boolean };
@@ -77,9 +94,18 @@ export interface CoreDeps {
   parentOf: (channelId: string) => string | null;
   repoOf: (channelId: string) => string | undefined;
   fetchMessage: (channelId: string, messageId: string) => Promise<GatewayMessage | null>;
+  /** Optional: where the names chats post under are kept, so a router restart still finds chats by them. */
+  aliasStore?: { get(sessionId: string): string[]; set(sessionId: string, names: string[]): void };
+  /** Optional: keep a record of direct messages (they appear nowhere else). */
+  logDirect?: (entry: Extract<RouterEvent, { type: "direct" }> & { to: string }) => void;
   /** Optional: refine a route's reason (e.g. a PR a Cursor agent opened). */
   enrich?: (route: Route, msg: GatewayMessage) => Promise<Route>;
 }
+
+/** Direct messages allowed between two chats (either way) in DIRECT_WINDOW_MS, so two agents can't wake each other forever. */
+export const DIRECT_LIMIT = 8;
+export const DIRECT_WINDOW_MS = 10 * 60_000;
+const MAX_DIRECT_CHARS = 8_000;
 
 /** How long a session that dropped its stream (a hot reload, a restart) keeps its claim and queue. */
 export const REATTACH_GRACE_MS = 2 * 60_000;
@@ -101,6 +127,8 @@ interface Attached {
   queue: RouterEvent[];
   detachedAt: number | null;
   lastClaims: string;
+  /** Names it has posted under (send_message's `from`), lowercased: how other chats address it. */
+  aliases: Set<string>;
 }
 
 /** Remembered routed message ids, so a mention seen live and in catch-up wakes one chat once. */
@@ -109,6 +137,8 @@ const ROUTED_MEMORY = 2_000;
 export class RouterCore {
   private readonly sessions = new Map<string, Attached>();
   private readonly routed = new Set<string>();
+  /** When each pair of chats last messaged each other directly, for DIRECT_LIMIT. */
+  private readonly directTimes = new Map<string, number[]>();
 
   constructor(private readonly deps: CoreDeps) {}
 
@@ -198,6 +228,7 @@ export class RouterCore {
       queue: [],
       detachedAt: null,
       lastClaims: "",
+      aliases: existing?.aliases ?? new Set(this.deps.aliasStore?.get(input.sessionId) ?? []),
     };
     this.sessions.set(input.sessionId, session);
     this.emitClaims(session);
@@ -370,7 +401,7 @@ export class RouterCore {
   private send(session: Attached, event: RouterEvent): void {
     if (session.sinks.size > 0) {
       for (const sink of session.sinks) sink.send(event);
-    } else if (event.type === "mention" || event.type === "overdue" || event.type === "moved") {
+    } else if (event.type === "mention" || event.type === "overdue" || event.type === "moved" || event.type === "direct") {
       session.queue.push(event);
       if (session.queue.length > QUEUE_LIMIT) session.queue.shift();
     }
@@ -629,8 +660,13 @@ export class RouterCore {
   }
 
   /** Control requests from a session's mod (via its attach process). */
-  control(sessionId: string, op: string, input: { threadId?: string; messageId?: string; channelId?: string }, threadParent?: string | null):
-    | { ok: true }
+  control(
+    sessionId: string,
+    op: string,
+    input: { threadId?: string; messageId?: string; channelId?: string; [key: string]: unknown },
+    threadParent?: string | null,
+  ):
+    | { ok: true; [key: string]: unknown }
     | { ok: false; status: number; error: string } {
     const session = this.sessions.get(sessionId);
     if (!session) return { ok: false, status: 404, error: "This chat isn't attached to the router." };
@@ -661,6 +697,18 @@ export class RouterCore {
         if (!taken.ok) return { ok: false, status: 409, error: `Already taken by ${this.nameOf(taken.takenBy)}.` };
         unmark(dirs.held, messageId);
         return { ok: true };
+      } else if (op === "alias") {
+        this.addAlias(session, String(input.name ?? ""));
+        return { ok: true };
+      } else if (op === "chats") {
+        return { ok: true, chats: this.otherChats(sessionId) };
+      } else if (op === "poster") {
+        // Which other chat here posted a Discord message, so a reply to it can go to that chat directly.
+        const poster = this.deps.ledger.owners(`msg:${String(input.messageId ?? "")}`)[0]?.sessionId;
+        const local = poster && poster !== sessionId ? this.sessions.get(poster) : undefined;
+        return { ok: true, session: local ? local.sessionId : null, label: local ? this.displayName(local) : null };
+      } else if (op === "direct") {
+        return this.direct(session, input);
       } else if (op === "hold") {
         mark(dirs.held, String(input.messageId ?? ""));
         return { ok: true };
@@ -703,6 +751,109 @@ export class RouterCore {
     session.lastClaims = "";
     this.emitClaims(session);
     return { ok: true };
+  }
+
+  private addAlias(session: Attached, raw: string): void {
+    const name = raw.trim().toLowerCase();
+    if (!name || name.length > 60) return;
+    session.aliases.delete(name);
+    session.aliases.add(name);
+    if (session.aliases.size > 10) session.aliases.delete(session.aliases.values().next().value!);
+    try {
+      this.deps.aliasStore?.set(session.sessionId, [...session.aliases]);
+    } catch {
+      // Remembered for this run either way.
+    }
+  }
+
+  /** How a chat is shown to others: the name it last posted under, else its label. */
+  private displayName(session: Attached): string {
+    return [...session.aliases].at(-1) ?? session.label ?? `${session.sessionId.slice(0, 8)}…`;
+  }
+
+  /** Other chats attached here, for list_chats. */
+  private otherChats(me: string) {
+    return [...this.sessions.values()]
+      .filter((s) => s.sessionId !== me)
+      .map((s) => ({
+        session: s.sessionId,
+        name: this.displayName(s),
+        label: s.label ?? null,
+        aliases: [...s.aliases],
+        connected: s.sinks.size > 0,
+      }));
+  }
+
+  /** The chat `to` names: a session id (or its first 8+ characters), a name it posts under, or its label. */
+  private resolveChat(me: Attached, to: string): { ok: true; session: Attached } | { ok: false; status: number; error: string } {
+    const wanted = to.trim().toLowerCase();
+    if (!wanted) return { ok: false, status: 400, error: "Say which chat (`to`)." };
+    if (me.sessionId.toLowerCase() === wanted || me.aliases.has(wanted)) return { ok: false, status: 400, error: "That's this chat." };
+    const others = [...this.sessions.values()].filter((s) => s !== me);
+    const byId = others.filter(
+      (s) => s.sessionId.toLowerCase() === wanted || (wanted.length >= 8 && s.sessionId.toLowerCase().startsWith(wanted)),
+    );
+    const byName = others.filter((s) => s.aliases.has(wanted) || s.label?.toLowerCase() === wanted);
+    const matches = byId.length ? byId : byName;
+    if (matches.length === 1) return { ok: true, session: matches[0]! };
+    if (matches.length > 1) {
+      const which = matches.map((s) => `${this.displayName(s)} (${s.sessionId.slice(0, 8)})`).join(", ");
+      return { ok: false, status: 409, error: `"${to}" matches ${matches.length} chats: ${which}. Use a session id.` };
+    }
+    const list = others.map((s) => this.displayName(s)).join(", ") || "none";
+    return { ok: false, status: 404, error: `No chat here called "${to}". Chats attached now: ${list}.` };
+  }
+
+  /** Delivers a direct message to another attached chat (queued if it's mid-reload). */
+  private direct(
+    session: Attached,
+    input: Record<string, unknown>,
+  ): { ok: true; [key: string]: unknown } | { ok: false; status: number; error: string } {
+    const content = String(input.content ?? "").trim();
+    if (!content) return { ok: false, status: 400, error: "Give the message text." };
+    if (content.length > MAX_DIRECT_CHARS) {
+      return { ok: false, status: 400, error: `Too long (${content.length} characters; at most ${MAX_DIRECT_CHARS}).` };
+    }
+    const found = this.resolveChat(session, String(input.to ?? ""));
+    if (!found.ok) return found;
+    const target = found.session;
+
+    const now = this.deps.now();
+    const pair = [session.sessionId, target.sessionId].sort().join("|");
+    const times = (this.directTimes.get(pair) ?? []).filter((t) => now - t < DIRECT_WINDOW_MS);
+    if (times.length >= DIRECT_LIMIT) {
+      this.directTimes.set(pair, times);
+      return {
+        ok: false,
+        status: 429,
+        error: `Not sent: ${times.length} direct messages between this chat and ${this.displayName(target)} in the last ${DIRECT_WINDOW_MS / 60_000} minutes. Stop the back-and-forth: post on Discord, or ask the person at your prompt.`,
+      };
+    }
+    times.push(now);
+    this.directTimes.set(pair, times);
+
+    const from = String(input.from ?? "").trim();
+    if (from) this.addAlias(session, from);
+    const about = input.about as { channelId?: unknown; messageId?: unknown } | undefined;
+    const aboutId = String(about?.messageId ?? "");
+    const replyToId = typeof input.replyToId === "string" ? input.replyToId.trim() : "";
+    const event: Extract<RouterEvent, { type: "direct" }> = {
+      type: "direct",
+      id: `d${now.toString(36)}${Math.random().toString(36).slice(2, 8)}`,
+      from: from || this.displayName(session),
+      fromSession: session.sessionId,
+      content,
+      ...(replyToId ? { replyToId } : {}),
+      ...(/^[0-9]{15,22}$/.test(aboutId) ? { about: { channelId: String(about?.channelId ?? ""), messageId: aboutId } } : {}),
+      sentAt: new Date(now).toISOString(),
+    };
+    this.send(target, event);
+    try {
+      this.deps.logDirect?.({ ...event, to: target.sessionId });
+    } catch {
+      // The record is a nicety; the message went.
+    }
+    return { ok: true, id: event.id, to: this.displayName(target), session: target.sessionId, queued: target.sinks.size === 0 };
   }
 
   private emitClaims(session: Attached): void {

@@ -13,10 +13,11 @@
  *   POST /attach {sessionId,label,channelIds}   → a stream of JSON event lines
  *   POST /control {sessionId,op,…}     ack · quiet · own · listen · claim-thread ·
  *                                      release-thread · take · hold · seen ·
- *                                      holder · defer · skip
+ *                                      holder · defer · skip · direct · chats ·
+ *                                      poster · alias
  *   POST /stop                         release every claim and exit
  */
-import { existsSync, linkSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, linkSync, mkdirSync, readFileSync, rmSync, statSync, truncateSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { ChannelType } from "discord.js";
 import { loadConfig, loadProjectEnv, projectRoot } from "./config.ts";
@@ -36,6 +37,8 @@ export const ROUTER_SOCKET = join(WATCH_DIR, "router.sock");
 export const ROUTER_PID = join(WATCH_DIR, "router.pid");
 export const ROUTER_ERROR = join(WATCH_DIR, "router-error.txt");
 const STATE_FILE = join(WATCH_DIR, "router-state.json");
+/** Every direct (chat-to-chat) message, one JSON line each: the only record of them, since they skip Discord. */
+export const DIRECT_LOG = join(WATCH_DIR, "direct.jsonl");
 
 /** Exit after this long with nobody attached. */
 const LINGER_MS = 30 * 60_000;
@@ -98,13 +101,15 @@ async function claimSingleInstance(): Promise<boolean> {
 interface State {
   /** Last message id seen in each watched channel: where catch-up starts next time. */
   watermarks: Record<string, string>;
+  /** Names each chat has posted under, for direct messages by name across router restarts. */
+  aliases: Record<string, string[]>;
 }
 
 function readState(): State {
   try {
-    return { watermarks: {}, ...(JSON.parse(readFileSync(STATE_FILE, "utf8")) as Partial<State>) };
+    return { watermarks: {}, aliases: {}, ...(JSON.parse(readFileSync(STATE_FILE, "utf8")) as Partial<State>) };
   } catch {
-    return { watermarks: {} };
+    return { watermarks: {}, aliases: {} };
   }
 }
 
@@ -167,6 +172,24 @@ async function main(): Promise<void> {
       return repoFromTopic(c && "topic" in c ? (c.topic as string | null) : null);
     },
     fetchMessage: (channelId, messageId) => rest.message(channelId, messageId),
+    aliasStore: {
+      get: (id) => state.aliases[id] ?? [],
+      set: (id, names) => {
+        state.aliases[id] = names;
+        // Keep the newest 200 chats' names.
+        const ids = Object.keys(state.aliases);
+        for (const old of ids.slice(0, Math.max(0, ids.length - 200))) delete state.aliases[old];
+        stateDirty = true;
+      },
+    },
+    logDirect: (entry) => {
+      try {
+        if (existsSync(DIRECT_LOG) && statSync(DIRECT_LOG).size > 5_000_000) truncateSync(DIRECT_LOG, 0);
+      } catch {
+        // A log we can't trim is still a log.
+      }
+      appendFileSync(DIRECT_LOG, `${JSON.stringify(entry)}\n`);
+    },
     enrich: async (route, msg) => {
       // Only for mentions nobody owns that name a PR: was it a Cursor cloud agent's?
       if (!route.to || !route.reason.startsWith("no chat owns this")) return route;

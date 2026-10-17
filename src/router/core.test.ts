@@ -5,7 +5,7 @@ import { describe, expect, test } from "bun:test";
 import { HookStore } from "../lib/hook.ts";
 import type { LedgerEntry } from "../lib/ledger.ts";
 import type { GatewayMessage } from "../lib/types.ts";
-import { REATTACH_GRACE_MS, RouterCore, type RouterEvent, type Sink } from "./core.ts";
+import { DIRECT_LIMIT, DIRECT_WINDOW_MS, REATTACH_GRACE_MS, RouterCore, type CoreDeps, type RouterEvent, type Sink } from "./core.ts";
 
 const BOT = "100000000000000007";
 const MANAGED = "100000000000000001";
@@ -14,7 +14,7 @@ const ACME = { id: "g1", name: "Example Guild" };
 const OTHER = { id: "g2", name: "Other Guild" };
 const OTHER_GENERAL = "100000000000000020";
 
-function setup(ledgerEntries: Array<Pick<LedgerEntry, "key" | "sessionId"> & Partial<LedgerEntry>> = []) {
+function setup(ledgerEntries: Array<Pick<LedgerEntry, "key" | "sessionId"> & Partial<LedgerEntry>> = [], extra: Partial<CoreDeps> = {}) {
   const root = mkdtempSync(join(tmpdir(), "tsukumo-router-"));
   let now = Date.parse("2026-10-09T18:00:00.000Z");
   const store = new HookStore(join(root, "hooks.json"), (id, current, hook) => id === current || (!!hook.heartbeatAt && now - Date.parse(hook.heartbeatAt) < 90_000));
@@ -30,6 +30,7 @@ function setup(ledgerEntries: Array<Pick<LedgerEntry, "key" | "sessionId"> & Par
     parentOf: () => null,
     repoOf: (id) => (id === MANAGED ? "acme/webapp" : undefined),
     fetchMessage: async (_c, id) => fetched.find((m) => m.id === id) ?? null,
+    ...extra,
   });
   const sinks: Record<string, RouterEvent[]> = {};
   const sink = (name: string): Sink => {
@@ -374,5 +375,100 @@ describe("RouterCore", () => {
     expect(sinks.b!.find((e) => e.type === "claims")).toMatchObject({ role: "listener", owner: "desk" });
     core.control("a", "release", {});
     expect(store.load("b")).toMatchObject({ role: "owner" });
+  });
+
+  describe("direct messages between chats", () => {
+    const directs = (events: RouterEvent[] | undefined) => (events ?? []).filter((e) => e.type === "direct") as Extract<RouterEvent, { type: "direct" }>[];
+
+    test("go to the chat named by the name it posts under, and nowhere else", () => {
+      const { core, sinks, sink, attach } = setup();
+      attach("a", "desk", sink("a"));
+      attach("b", "farm · 12345678", sink("b"));
+      attach("c", "other", sink("c"));
+      core.control("b", "alias", { name: "Garden Work" });
+
+      const sent = core.control("a", "direct", { to: "garden work", content: "your build is broken", from: "front desk" });
+      expect(sent).toMatchObject({ ok: true, to: "garden work", session: "b", queued: false });
+      expect(directs(sinks.b)).toEqual([
+        expect.objectContaining({ from: "front desk", fromSession: "a", content: "your build is broken" }),
+      ]);
+      expect(directs(sinks.a)).toEqual([]);
+      expect(directs(sinks.c)).toEqual([]);
+
+      // The sender is now addressable by the name it sent under, so the answer finds its way back.
+      expect(core.control("b", "direct", { to: "Front Desk", content: "fixed", replyToId: directs(sinks.b)[0]!.id })).toMatchObject({ ok: true, session: "a" });
+      expect(directs(sinks.a)[0]).toMatchObject({ content: "fixed", replyToId: directs(sinks.b)[0]!.id });
+    });
+
+    test("find a chat by session id or label, and refuse unknown, ambiguous and self", () => {
+      const { core, sink, attach } = setup();
+      attach("a", "desk", sink("a"));
+      attach("bbbbbbbb-1111", "worker", sink("b"));
+      attach("bbbbbbbb-2222", "worker", sink("c"));
+      expect(core.control("a", "direct", { to: "bbbbbbbb-2222", content: "hi" })).toMatchObject({ ok: true, session: "bbbbbbbb-2222" });
+      expect(core.control("a", "direct", { to: "worker", content: "hi" })).toMatchObject({ ok: false, status: 409 });
+      expect(core.control("a", "direct", { to: "nobody", content: "hi" })).toMatchObject({ ok: false, status: 404 });
+      expect(core.control("a", "direct", { to: "a", content: "hi" })).toMatchObject({ ok: false, status: 400 });
+      expect(core.control("a", "direct", { to: "bbbbbbbb-2222", content: "  " })).toMatchObject({ ok: false, status: 400 });
+    });
+
+    test("a reply to a Discord message another chat posted can be told apart", () => {
+      const { core, sink, attach } = setup([{ key: "msg:155700000000000999", sessionId: "b", label: "farm" }]);
+      attach("a", "desk", sink("a"));
+      attach("b", "farm", sink("b"));
+      expect(core.control("a", "poster", { messageId: "155700000000000999" })).toMatchObject({ ok: true, session: "b", label: "farm" });
+      // Its own post, or one no chat here made, isn't a chat-to-chat reply.
+      expect(core.control("b", "poster", { messageId: "155700000000000999" })).toMatchObject({ ok: true, session: null });
+      expect(core.control("a", "poster", { messageId: "155700000000000123" })).toMatchObject({ ok: true, session: null });
+    });
+
+    test("cap the back-and-forth between two chats, then allow it again after the window", () => {
+      const { core, sinks, sink, attach, advance } = setup();
+      attach("a", "desk", sink("a"));
+      attach("b", "farm", sink("b"));
+      for (let i = 0; i < DIRECT_LIMIT; i++) {
+        const [from, to] = i % 2 ? ["b", "a"] : ["a", "b"];
+        expect(core.control(from!, "direct", { to: to!, content: `ping ${i}` })).toMatchObject({ ok: true });
+      }
+      expect(core.control("a", "direct", { to: "b", content: "one more" })).toMatchObject({ ok: false, status: 429 });
+      expect(directs(sinks.b).length).toBe(DIRECT_LIMIT / 2);
+      advance(DIRECT_WINDOW_MS + 1_000);
+      expect(core.control("a", "direct", { to: "b", content: "later" })).toMatchObject({ ok: true });
+    });
+
+    test("wait for a chat that's reloading, and arrive when it reattaches", () => {
+      const { core, sinks, sink, attach } = setup();
+      attach("a", "desk", sink("a"));
+      const first = sink("b");
+      attach("b", "farm", first);
+      core.detach("b", first);
+      expect(core.control("a", "direct", { to: "farm", content: "while you were out" })).toMatchObject({ ok: true, queued: true });
+      attach("b", "farm", sink("b2"));
+      expect(directs(sinks.b2).map((e) => e.content)).toEqual(["while you were out"]);
+    });
+
+    test("a restarted router still finds a chat by the name it posted under", () => {
+      const saved = new Map<string, string[]>();
+      const aliasStore = { get: (id: string) => saved.get(id) ?? [], set: (id: string, names: string[]) => void saved.set(id, names) };
+      const before = setup([], { aliasStore });
+      before.attach("b", "farm", before.sink("b"));
+      before.core.control("b", "alias", { name: "garden work" });
+
+      const after = setup([], { aliasStore });
+      after.attach("a", "desk", after.sink("a"));
+      after.attach("b", "farm", after.sink("b"));
+      expect(after.core.control("a", "direct", { to: "garden work", content: "still there?" })).toMatchObject({ ok: true, session: "b" });
+    });
+
+    test("list the other chats with the names they go by", () => {
+      const { core, sink, attach } = setup();
+      attach("a", "desk", sink("a"));
+      attach("b", "farm", sink("b"));
+      core.control("b", "alias", { name: "garden work" });
+      expect(core.control("a", "chats", {})).toMatchObject({
+        ok: true,
+        chats: [{ session: "b", name: "garden work", label: "farm", aliases: ["garden work"], connected: true }],
+      });
+    });
   });
 });

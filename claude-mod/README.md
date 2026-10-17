@@ -100,7 +100,9 @@ Or just ask Claude ("watch #dev", "what's the latest in #general?", "post the PR
 | `get_message` | One message by id |
 | `defer_mention` | Say privately that this chat will answer a mention later (up to 12 h); it stays here, and you're only reminded if the time passes |
 | `skip_mention` | Choose not to reply to a mention that needs no answer (a thanks, a 👍, a GIF); nothing is posted, 👀 and typing come off, and it counts as answered |
-| `send_message` | Post (or reply) in any channel the bot can see, prefixed with the bold `from` name (default `Claude`). A reply is refused if Tsukumo already replied to that message in the last few minutes (another chat got there first); `allow_duplicate: true` for a deliberate second reply. `gif` (a Tenor or Giphy page link, or a direct .gif URL) uploads the GIF itself, with or without text |
+| `send_message` | Post (or reply) in any channel the bot can see, prefixed with the bold `from` name (default `Claude`). A reply is refused if Tsukumo already replied to that message in the last few minutes (another chat got there first); `allow_duplicate: true` for a deliberate second reply. `gif` (a Tenor or Giphy page link, or a direct .gif URL) uploads the GIF itself, with or without text. A reply to a message **another chat on this machine posted** goes to that chat directly (see `message_chat`) instead of Discord, where it would never wake it; `post: true` posts it anyway |
+| `message_chat` | Message another chat on this machine directly: it wakes that chat, and nothing is posted on Discord. `to` is the name it posts under (its `from`), its label or session id. The woken chat answers with `message_chat` too. At most 8 messages between two chats (both ways) per 10 minutes, so two agents can't wake each other forever. Every one is logged in `.watch/direct.jsonl` |
+| `list_chats` | The other chats attached to the router, with the names they post under |
 | `start_thread` | Open a thread for a work item in a watched channel and claim it for this chat |
 | `claim_thread` / `release_thread` | Answer (or stop answering) a thread's mentions from this chat |
 
